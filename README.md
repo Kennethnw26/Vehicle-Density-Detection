@@ -88,28 +88,7 @@ Due to GitHub's file size limitations, video files are **not included in this re
 
 ### 📦 Download Videos
 
-The videos are provided as a **videos.zip file**.
-
-### 📁 Setup Instructions
-
-1. Download the ZIP file
-2. Extract it
-3. Place the videos inside a folder named:
-
-```
-videos/
-```
-
-So your structure becomes:
-
-```
-Vehicle-Density-Detection/
-├── main.py
-├── videos/
-│   ├── traffic.mp4
-│   ├── traffic2.mp4
-│   └── ...
-```
+The videos used are mostly from youtube, therefore any videos can be used as long as you adjust the file name accordingly with the main code
 
 ---
 
