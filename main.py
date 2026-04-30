@@ -7,19 +7,25 @@ model = YOLO("yolov8n.pt")
 
 cap = cv2.VideoCapture("videos/traffic4.mp4")
 
-vehicle_classes = [2, 3, 5, 7]
-CONF_THRESHOLD = 0.5
+VEHICLE_CLASSES = {2: "Car", 3: "Motorcycle", 5: "Bus", 7: "Truck"}
+CONF_THRESHOLD = 0.4
 
-# Multi Lane 
+# Lane state
 lanes = []
 current_lane = []
-drawing_mode = True  # control whether user is drawing lanes
+drawing_mode = True
 
-# Tracking
+# Tracker state
 next_id = 0
-tracked_objects = {}  # id: (cx, cy)
+tracked_objects = {}   # id -> {"pos": (cx, cy), "cls": str, "conf": float, "age": int}
+MAX_LOST_FRAMES = 5    # frames before dropping a lost track
+DIST_THRESHOLD = 60
 
-DIST_THRESHOLD = 50
+DENSITY_COLORS = {
+    "LOW":    (0, 200, 0),
+    "MEDIUM": (0, 165, 255),
+    "HIGH":   (0, 0, 220),
+}
 
 
 def classify_density(count):
@@ -27,11 +33,10 @@ def classify_density(count):
         return "LOW"
     elif count <= 7:
         return "MEDIUM"
-    else:
-        return "HIGH"
+    return "HIGH"
 
 
-# Mouse callback
+
 def mouse_callback(event, x, y, flags, param):
     global current_lane, lanes, drawing_mode
 
@@ -40,133 +45,163 @@ def mouse_callback(event, x, y, flags, param):
 
     if event == cv2.EVENT_LBUTTONDOWN:
         current_lane.append((x, y))
-        print(f"Point: {(x, y)}")
 
         if len(current_lane) == 4:
-            lanes.append(np.array(current_lane))
-            print("Lane added!")
+            lanes.append(np.array(current_lane, dtype=np.int32))
+            print(f"Lane {len(lanes)} added.")
             current_lane = []
 
-cv2.namedWindow("Multi-Lane Detection")
-cv2.setMouseCallback("Multi-Lane Detection", mouse_callback)
+
+def draw_lanes(frame, lane_counts):
+    for i, lane in enumerate(lanes):
+        density = classify_density(lane_counts[i])
+        color = DENSITY_COLORS[density]
+
+        overlay = frame.copy()
+        cv2.fillPoly(overlay, [lane], color)
+        cv2.addWeighted(overlay, 0.25, frame, 0.75, 0, frame)
+        cv2.polylines(frame, [lane], True, color, 2)
+
+        cx = int(np.mean(lane[:, 0]))
+        cy = int(np.mean(lane[:, 1]))
+        cv2.putText(frame, f"L{i+1}: {lane_counts[i]} ({density})",
+                    (cx - 40, cy),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2)
+
+
+def draw_partial_lane(frame):
+    if not drawing_mode or not current_lane:
+        return
+    for pt in current_lane:
+        cv2.circle(frame, pt, 6, (0, 255, 255), -1)
+    for i in range(1, len(current_lane)):
+        cv2.line(frame, current_lane[i - 1], current_lane[i], (0, 255, 255), 1)
+
+
+def draw_hud(frame, total_vehicles):
+    h, w = frame.shape[:2]
+
+    if drawing_mode:
+        msg = f"DRAW MODE | Lanes: {len(lanes)} | Click 4 pts/lane | [S] start detection | [R] reset | [Q/ESC] quit"
+        color = (0, 255, 255)
+    else:
+        msg = f"DETECT MODE | Lanes: {len(lanes)} | Vehicles: {total_vehicles} | [R] reset | [Q/ESC] quit"
+        color = (0, 255, 0)
+
+    cv2.rectangle(frame, (0, 0), (w, 35), (0, 0, 0), -1)
+    cv2.putText(frame, msg, (8, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.48, color, 1)
+
+
+def match_detections_to_tracks(detections, tracked_objects, dist_threshold):
+    """Simple nearest-neighbour matching with age-based pruning."""
+    global next_id
+
+    updated = {}
+
+    for det in detections:
+        cx, cy, x1, y1, x2, y2, cls_name, conf = det
+
+        best_id = None
+        best_dist = dist_threshold  # shrinks as we find closer matches
+        for obj_id, info in tracked_objects.items():
+            px, py = info["pos"]
+            d = math.hypot(cx - px, cy - py)
+            if d < best_dist:
+                best_dist = d
+                best_id = obj_id
+
+        if best_id is None:
+            best_id = next_id
+            next_id += 1
+
+        updated[best_id] = {
+            "pos": (cx, cy),
+            "box": (x1, y1, x2, y2),
+            "cls": cls_name,
+            "conf": conf,
+            "age": 0,
+        }
+
+    # Keep lost tracks alive for a few frames
+    for obj_id, info in tracked_objects.items():
+        if obj_id not in updated:
+            if info["age"] < MAX_LOST_FRAMES:
+                info["age"] += 1
+                updated[obj_id] = info
+
+    return updated
+
+
+cv2.namedWindow("Vehicle Density Detection")
+cv2.setMouseCallback("Vehicle Density Detection", mouse_callback)
 
 while True:
     ret, frame = cap.read()
     if not ret:
-        break
+        # Loop video
+        cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+        continue
 
     results = model(frame, verbose=False)[0]
 
     detections = []
-
-    # -------- DETECTION --------
     for box in results.boxes:
         cls = int(box.cls[0])
         conf = float(box.conf[0])
 
-        if conf < CONF_THRESHOLD:
+        if conf < CONF_THRESHOLD or cls not in VEHICLE_CLASSES:
             continue
 
-        if cls in vehicle_classes:
-            x1, y1, x2, y2 = map(int, box.xyxy[0])
+        x1, y1, x2, y2 = map(int, box.xyxy[0])
+        cx = (x1 + x2) // 2
+        cy = y2  # bottom center (more stable for lane assignment)
+        cls_name = VEHICLE_CLASSES[cls]
 
-            cx = (x1 + x2) // 2
-            cy = y2  # bottom center
+        detections.append((cx, cy, x1, y1, x2, y2, cls_name, conf))
 
-            detections.append((cx, cy, x1, y1, x2, y2))
+    tracked_objects = match_detections_to_tracks(detections, tracked_objects, DIST_THRESHOLD)
 
-    # -------- TRACKING --------
-    new_tracked = {}
+    # Draw tracked vehicles
+    for obj_id, info in tracked_objects.items():
+        if "box" not in info:
+            continue
+        x1, y1, x2, y2 = info["box"]
+        cls_name = info["cls"]
+        conf = info["conf"]
+        label = f"{cls_name} #{obj_id} ({conf:.2f})"
+        cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 220, 0), 2)
+        cv2.putText(frame, label, (x1, y1 - 8),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 220, 0), 1)
 
-    for det in detections:
-        cx, cy, x1, y1, x2, y2 = det
-
-        matched_id = None
-
-        for obj_id, (px, py) in tracked_objects.items():
-            dist = math.hypot(cx - px, cy - py)
-
-            if dist < DIST_THRESHOLD:
-                matched_id = obj_id
-                break
-
-        if matched_id is None:
-            matched_id = next_id
-            next_id += 1
-
-        new_tracked[matched_id] = (cx, cy)
-
-        # Draw bounding box + ID
-        label = f"ID {matched_id}"
-        cv2.rectangle(frame, (x1, y1), (x2, y2), (0,255,0), 2)
-        cv2.putText(frame, label, (x1, y1-10),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,255,0), 2)
-
-    tracked_objects = new_tracked
-
-    # -------- MULTI-LANE COUNT --------
-    lane_counts = [0 for _ in lanes]
-
-    for obj_id, (cx, cy) in tracked_objects.items():
+    # Lane vehicle counts
+    lane_counts = [0] * len(lanes)
+    for info in tracked_objects.values():
+        cx, cy = info["pos"]
         for i, lane in enumerate(lanes):
-            if cv2.pointPolygonTest(lane, (cx, cy), False) >= 0:
+            if cv2.pointPolygonTest(lane, (float(cx), float(cy)), False) >= 0:
                 lane_counts[i] += 1
 
-    # -------- DRAW LANES --------
-    for i, lane in enumerate(lanes):
-        cv2.polylines(frame, [lane], True, (255,0,0), 2)
+    draw_lanes(frame, lane_counts)
+    draw_partial_lane(frame)
+    draw_hud(frame, len([i for i in tracked_objects.values() if i["age"] == 0]))
 
-        density = classify_density(lane_counts[i])
-
-        cv2.putText(frame,
-                    f"Lane {i+1}: {lane_counts[i]} ({density})",
-                    (20, 60 + i*40),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.7,
-                    (0,0,255),
-                    2)
-
-    # -------- DRAW CURRENT LANE (while clicking) --------
-    if drawing_mode and len(current_lane) > 0:
-        for point in current_lane:
-            cv2.circle(frame, point, 5, (0,255,255), -1)
-
-    # -------- MODE DISPLAY --------
-    if drawing_mode:
-        cv2.putText(frame,
-                    "DRAW MODE: Click 4 points per lane, press 's' to start",
-                    (20, 25),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.5,
-                    (0,255,255),
-                    2)
-    else:
-        cv2.putText(frame,
-                    "DETECTION MODE (press 'r' to reset)",
-                    (20, 25),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.5,
-                    (0,255,0),
-                    2)
-
-    cv2.imshow("Multi-Lane Detection", frame)
+    cv2.imshow("Vehicle Density Detection", frame)
 
     key = cv2.waitKey(1) & 0xFF
 
-    # Lock lanes
     if key == ord('s'):
         drawing_mode = False
-        print("Lanes locked. Detection started.")
+        print(f"Detection started. {len(lanes)} lane(s) active.")
 
-    # Reset everything
-    if key == ord('r'):
+    elif key == ord('r'):
         lanes = []
         current_lane = []
         tracked_objects = {}
+        next_id = 0
         drawing_mode = True
-        print("Reset everything")
+        print("Reset.")
 
-    if key == 27:
+    elif key in (27, ord('q')):
         break
 
 cap.release()
